@@ -103,7 +103,18 @@ _font_cache = {}
 def get_font(size, bold=False):
     key = (size, bold)
     if key not in _font_cache:
-        _font_cache[key] = pygame.font.SysFont("Segoe UI,Arial,DejaVu Sans", size, bold=bold)
+        if not pygame.font.get_init():
+            pygame.font.init()
+        # pygame.font.SysFont can crash on some Windows font registries when
+        # scanning installed fonts. Use the bundled default font first so the
+        # visualizer starts reliably on every Pygame install, then fall back to
+        # SysFont only if the default loader is unavailable.
+        try:
+            font = pygame.font.Font(None, size)
+        except Exception:
+            font = pygame.font.SysFont(None, size, bold=bold)
+        font.set_bold(bold)
+        _font_cache[key] = font
     return _font_cache[key]
 
 
