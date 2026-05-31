@@ -10,10 +10,7 @@ from tkinter import filedialog
 from mutagen.id3 import ID3, APIC
 from mutagen.flac import FLAC
 from mutagen.mp4 import MP4
-try:
-    import moviepy.editor as mpy  # Optional: kept for compatibility with earlier builds.
-except Exception:
-    mpy = None
+import moviepy as mpy  # MoviePy 2.x exposes its public API from the top-level package.
 
 # -------------------------------------------------------------------------
 # CONSTANTS & LAYOUT
@@ -261,16 +258,30 @@ class LetterPathCache:
         pad = 28
         canvas = pygame.Surface((mask_surf.get_width() + pad * 2, mask_surf.get_height() + pad * 2), pygame.SRCALPHA)
         canvas.blit(mask_surf, (pad, pad))
-        mask = pygame.mask.from_surface(canvas)
-        outlines = mask.outlines()
-        raw = []
-        for outline in outlines:
-            if len(outline) > 22:
-                raw.extend(outline[::max(1, len(outline) // 180)])
-        if len(raw) < 8:
+        # Pygame exposes Mask.outline() (singular), not Mask.outlines() on
+        # current releases.  Instead of relying on a single connected-component
+        # outline, derive all edge pixels from the alpha channel so letters with
+        # holes or multiple glyphs still produce a full Avee-like path.
+        alpha = pygame.surfarray.array_alpha(canvas)
+        solid = alpha > 0
+        if solid.shape[0] < 3 or solid.shape[1] < 3:
             self.points = []
             return self.points
-        arr = np.array(raw, dtype=float)
+        inner = np.zeros_like(solid, dtype=bool)
+        inner[1:-1, 1:-1] = (
+            solid[1:-1, 1:-1]
+            & solid[:-2, 1:-1]
+            & solid[2:, 1:-1]
+            & solid[1:-1, :-2]
+            & solid[1:-1, 2:]
+        )
+        edge = solid & ~inner
+        xs, ys = np.nonzero(edge)
+        if len(xs) < 8:
+            self.points = []
+            return self.points
+        step = max(1, len(xs) // max(count * 4, 1))
+        arr = np.column_stack((xs[::step], ys[::step])).astype(float)
         arr[:, 0] -= canvas.get_width() / 2
         arr[:, 1] -= canvas.get_height() / 2
         scale = min(WIDTH * 0.62 / max(1, canvas.get_width()), HEIGHT * 0.36 / max(1, canvas.get_height()))
