@@ -23,7 +23,7 @@ PATH_MODES = ("LETTER", "CIRCLE", "LINE")
 
 def get_button_rects(w, h):
     bw, bh, gap = 118, 30, 8
-    panel_top = h - 182
+    panel_top = h - 206
     col0, col1, col2 = 22, 22 + bw + gap, 22 + (bw + gap) * 2
 
     def row(r):
@@ -81,7 +81,7 @@ class RenderState:
         self.rotation = 0.0
         self.time = 0.0
         self.original_cover = None
-        self.path_mode_index = 0
+        self.path_mode_index = 1
 
     @property
     def path_mode(self):
@@ -491,12 +491,12 @@ PPE_Mirror = MirrorEffectElement()
 PPE_Blur = BlurEffectElement()
 PPE_Color = ColorCorrectionElement()
 
-PPE_RGB.enabled = True
-PPE_MBlur.enabled = True
-PPE_Glow.enabled = True
+PPE_RGB.enabled = False
+PPE_MBlur.enabled = False
+PPE_Glow.enabled = False
 PPE_Mirror.enabled = False
 PPE_Blur.enabled = False
-PPE_Color.enabled = True
+PPE_Color.enabled = False
 
 for element in (CompAudio, CompParts, CompBars, CompImage, CompText, PPE_Glow, PPE_Blur, PPE_MBlur, PPE_Mirror, PPE_Color, PPE_RGB):
     Root.add(element)
