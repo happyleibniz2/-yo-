@@ -3,6 +3,8 @@ import numpy as np
 import soundfile as sf
 import math
 import random
+import threading
+import time
 import os
 import io
 import tkinter as tk
@@ -90,6 +92,28 @@ class RenderState:
 
 RS = RenderState()
 data, samplerate, sound = None, None, None
+play_channel = None
+play_pos_ms = None
+play_pos_lock = threading.Lock()
+play_start_monotonic = None
+
+
+def _poll_play_pos(channel):
+    """Background thread: poll Channel.get_pos() at ~20Hz and cache the result."""
+    global play_pos_ms
+    try:
+        while channel is not None and channel.get_busy():
+            try:
+                pos = channel.get_pos()
+            except Exception:
+                pos = None
+            with play_pos_lock:
+                play_pos_ms = pos
+            time.sleep(0.05)
+    finally:
+        with play_pos_lock:
+            play_pos_ms = None
+        # leave play_start_monotonic intact; reload_audio will reset it
 title, artist = "Avee Pygame", "Pure CPU Visualizer"
 volume = 0.82
 show_ui = True
@@ -152,9 +176,23 @@ class AudioDataProviderElement(Element):
     def __init__(self):
         super().__init__()
         self.shake_target = np.array([0.0, 0.0])
+        # no per-frame audio queries; use background poller
 
     def update(self, rs: RenderState):
-        rs.time += rs.dt
+        # Drive `rs.time` from the cached playback position provided by the
+        # background poller thread. Fallback to dt when no valid position.
+        global play_pos_ms, play_start_monotonic
+        pos = None
+        with play_pos_lock:
+            pos = play_pos_ms
+        if data is not None and sound and pos is not None and pos >= 0:
+            rs.time = pos / 1000.0
+        elif play_start_monotonic is not None:
+            # Fallback to monotonic time since we started playback; keeps
+            # visuals roughly in sync even if get_pos temporarily fails.
+            rs.time = time.monotonic() - play_start_monotonic
+        else:
+            rs.time += rs.dt
         if data is not None and sound and pygame.mixer.get_busy():
             idx = int(rs.time * samplerate)
             if idx + 2048 < len(data):
@@ -536,7 +574,25 @@ def reload_audio(file):
         pygame.mixer.init(samplerate, -16, 2, 2048)
         sound = pygame.mixer.Sound(file)
         sound.set_volume(volume)
-        sound.play()
+        # Keep reference to the Channel so we can query playback position
+        ch = sound.play()
+        global play_channel
+        play_channel = ch
+        global play_start_monotonic
+        play_start_monotonic = time.monotonic()
+        with play_pos_lock:
+            play_pos_ms = 0
+        if ch:
+            try:
+                ch.set_volume(volume)
+            except Exception:
+                pass
+            # start background poller to cache playback position
+            try:
+                t = threading.Thread(target=_poll_play_pos, args=(ch,), daemon=True)
+                t.start()
+            except Exception:
+                pass
         title = os.path.splitext(os.path.basename(file))[0]
         artist = "Loaded track"
         RS.time = 0.0
