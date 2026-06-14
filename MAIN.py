@@ -12,7 +12,7 @@ from tkinter import filedialog
 from mutagen.id3 import ID3, APIC
 from mutagen.flac import FLAC
 from mutagen.mp4 import MP4
-import moviepy as mpy  # MoviePy 2.x exposes its public API from the top-level package.
+# moviepy imported previously but unused — removed to speed startup.
 
 # -------------------------------------------------------------------------
 # CONSTANTS & LAYOUT
@@ -21,6 +21,11 @@ SAMPLE_COUNT = 144
 WIDTH, HEIGHT = 1000, 820
 CENTER = np.array([WIDTH // 2, HEIGHT // 2], dtype=float)
 PATH_MODES = ("LETTER", "CIRCLE", "LINE")
+
+# audio visualization offset (ms) to compensate latency/export timing; 0 by default
+AUDIO_VIS_OFFSET_MS = 0
+# beat detection mode: 'flux' (spectral-flux) or 'rms' (RMS-based like Avee)
+BEAT_MODE = "flux"
 
 
 def get_button_rects(w, h):
@@ -73,6 +78,9 @@ class RenderState:
     def __init__(self):
         self.dt = 0.016
         self.fft = np.zeros(SAMPLE_COUNT)
+        self.prev_fft = np.zeros(SAMPLE_COUNT)
+        self.rms = 0.0
+        self.rms_history = []
         self.smooth_bars = np.zeros(SAMPLE_COUNT)
         self.peak_bars = np.zeros(SAMPLE_COUNT)
         self.peak_timer = np.zeros(SAMPLE_COUNT)
@@ -84,6 +92,7 @@ class RenderState:
         self.time = 0.0
         self.original_cover = None
         self.path_mode_index = 1
+        self.flux_history = []
 
     @property
     def path_mode(self):
@@ -194,9 +203,18 @@ class AudioDataProviderElement(Element):
         else:
             rs.time += rs.dt
         if data is not None and sound and pygame.mixer.get_busy():
-            idx = int(rs.time * samplerate)
+            # apply user-configurable visualization offset (ms)
+            idx = int((rs.time + (AUDIO_VIS_OFFSET_MS / 1000.0)) * samplerate)
             if idx + 2048 < len(data):
                 chunk = data[idx:idx + 2048]
+                # compute RMS from raw PCM chunk (matches Avee behavior)
+                try:
+                    rs.rms = float(np.sqrt(np.mean(chunk.astype(float) ** 2)))
+                except Exception:
+                    rs.rms = float(np.sqrt(np.mean((chunk) ** 2)))
+                rs.rms_history.append(rs.rms)
+                if len(rs.rms_history) > 46:
+                    rs.rms_history.pop(0)
                 fft_raw = np.abs(np.fft.rfft(chunk * WINDOW))
                 for b in range(SAMPLE_COUNT):
                     lo, hi = _bar_lo[b], _bar_hi[b]
@@ -207,30 +225,37 @@ class AudioDataProviderElement(Element):
                 max_v = np.max(rs.fft)
                 if max_v > 1e-4:
                     rs.fft /= max_v
+                if BEAT_MODE == "flux":
+                    # spectral-flux beat detection (more robust than simple band ratio)
+                    flux = float(np.sum(np.maximum(rs.fft - rs.prev_fft, 0.0)))
+                    rs.prev_fft = rs.fft.copy()
+                    rs.flux_history.append(flux)
+                    if len(rs.flux_history) > 46:
+                        rs.flux_history.pop(0)
+                    avg_flux = float(np.mean(rs.flux_history[:-1])) if len(rs.flux_history) > 6 else 0.0
+                    if avg_flux > 1e-6 and flux > max(0.02, avg_flux * 1.5):
+                        rs.is_beat = True
+                        rs.smooth_beat = rs.smooth_beat * 0.34 + min(flux / (avg_flux * 2.0), 1.0) * 0.66
+                    else:
+                        rs.is_beat = False
+                        rs.smooth_beat *= 0.88
+                else:
+                    # RMS-based beat detection (Avee-like): detect bursts over recent RMS
+                    avg_rms = float(np.mean(rs.rms_history[:-1])) if len(rs.rms_history) > 6 else 0.0
+                    if avg_rms > 1e-8 and rs.rms > max(1e-4, avg_rms * 1.5):
+                        rs.is_beat = True
+                        rs.smooth_beat = rs.smooth_beat * 0.34 + min(rs.rms / (avg_rms * 2.0), 1.0) * 0.66
+                    else:
+                        rs.is_beat = False
+                        rs.smooth_beat *= 0.88
         else:
             # Idle demo signal so the UI/effects are visible before loading a track.
             phase = rs.time * 2.0
             xs = np.linspace(0, 1, SAMPLE_COUNT)
             rs.fft = np.maximum(0.0, np.sin(xs * 9.0 + phase) * 0.25 + np.sin(xs * 31.0 - phase * 1.7) * 0.18)
 
-        beat_conf = 0.0
-        for band, (lo, hi) in BEAT_BANDS.items():
-            en = float(np.mean(rs.fft[lo:min(hi, len(rs.fft))]))
-            hist = beat_energy_history[band]
-            hist.append(en)
-            if len(hist) > 46:
-                hist.pop(0)
-            if len(hist) > 6 and np.mean(hist[:-1]) > 1e-6:
-                ratio = en / np.mean(hist[:-1])
-                if ratio > 1.28:
-                    beat_conf += 0.38 * ratio
-
+        # energy follows mean of fft (keeps visuals responsive)
         rs.energy = rs.energy * 0.82 + float(np.mean(rs.fft)) * 0.18
-        rs.is_beat = beat_conf > 0.78
-        if rs.is_beat:
-            rs.smooth_beat = rs.smooth_beat * 0.34 + min(beat_conf / 2.0, 1.0) * 0.66
-        else:
-            rs.smooth_beat *= 0.88
 
         for i in range(SAMPLE_COUNT):
             target = rs.fft[i]
@@ -270,11 +295,13 @@ class ImageElement(Element):
         pygame.draw.circle(surface, (6, 7, 11, 180), (cx + 5, cy + 7), rad + 6)
         if rs.original_cover:
             sz = rad * 2
-            pg_img = pygame.transform.smoothscale(rs.original_cover, (sz, sz))
+            pg_img = pygame.transform.smoothscale(rs.original_cover, (sz, sz)).convert_alpha()
             mask = pygame.Surface((sz, sz), pygame.SRCALPHA)
             pygame.draw.circle(mask, (255, 255, 255, 255), (rad, rad), rad)
-            pg_img.blit(mask, (0, 0), special_flags=pygame.BLEND_RGBA_MIN)
-            surface.blit(pg_img, (cx - rad, cy - rad))
+            result = pygame.Surface((sz, sz), pygame.SRCALPHA)
+            result.blit(pg_img, (0, 0))
+            result.blit(mask, (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
+            surface.blit(result, (cx - rad, cy - rad))
         else:
             pygame.draw.circle(surface, (20, 22, 30), (cx, cy), rad)
             pygame.draw.circle(surface, (0, 235, 255), (cx, cy), rad, 3)
@@ -296,44 +323,48 @@ class LetterPathCache:
         pad = 28
         canvas = pygame.Surface((mask_surf.get_width() + pad * 2, mask_surf.get_height() + pad * 2), pygame.SRCALPHA)
         canvas.blit(mask_surf, (pad, pad))
-        # Pygame exposes Mask.outline() (singular), not Mask.outlines() on
-        # current releases.  Instead of relying on a single connected-component
-        # outline, derive all edge pixels from the alpha channel so letters with
-        # holes or multiple glyphs still produce a full Avee-like path.
-        alpha = pygame.surfarray.array_alpha(canvas)
-        solid = alpha > 0
-        if solid.shape[0] < 3 or solid.shape[1] < 3:
+        try:
+            mask = pygame.mask.from_surface(canvas)
+            outline_pts = mask.outline()
+            if len(outline_pts) < 8:
+                self.points = []
+                return self.points
+            arr = np.array(outline_pts, dtype=float)
+            arr[:, 0] -= canvas.get_width() / 2
+            arr[:, 1] -= canvas.get_height() / 2
+            scale = min(WIDTH * 0.62 / max(1, canvas.get_width()), HEIGHT * 0.36 / max(1, canvas.get_height()))
+            arr *= scale
+            center = np.array([WIDTH / 2, HEIGHT / 2 + 10], dtype=float)
+            arr += center
+            # sample along the polygon by arc length for even distribution
+            deltas = np.diff(arr, axis=0, append=arr[:1])
+            dists = np.hypot(deltas[:, 0], deltas[:, 1])
+            cum = np.cumsum(dists)
+            total = cum[-1]
+            if total <= 0:
+                self.points = []
+                return self.points
+            positions = np.linspace(0, total, count, endpoint=False)
+            idxs = np.searchsorted(cum, positions)
+            pts = []
+            for p, i_idx in zip(positions, idxs):
+                prev_idx = (i_idx - 1) % len(arr)
+                seg_start = cum[prev_idx] if prev_idx >= 0 else 0.0
+                seg_len = dists[prev_idx]
+                if seg_len == 0:
+                    t = 0.0
+                else:
+                    t = (p - seg_start) / seg_len
+                a = arr[prev_idx]
+                b = arr[i_idx % len(arr)]
+                pt = a + (b - a) * t
+                pts.append((float(pt[0]), float(pt[1])))
+            self.points = pts
+            self.key = key
+            return self.points
+        except Exception:
             self.points = []
             return self.points
-        inner = np.zeros_like(solid, dtype=bool)
-        inner[1:-1, 1:-1] = (
-            solid[1:-1, 1:-1]
-            & solid[:-2, 1:-1]
-            & solid[2:, 1:-1]
-            & solid[1:-1, :-2]
-            & solid[1:-1, 2:]
-        )
-        edge = solid & ~inner
-        xs, ys = np.nonzero(edge)
-        if len(xs) < 8:
-            self.points = []
-            return self.points
-        step = max(1, len(xs) // max(count * 4, 1))
-        arr = np.column_stack((xs[::step], ys[::step])).astype(float)
-        arr[:, 0] -= canvas.get_width() / 2
-        arr[:, 1] -= canvas.get_height() / 2
-        scale = min(WIDTH * 0.62 / max(1, canvas.get_width()), HEIGHT * 0.36 / max(1, canvas.get_height()))
-        arr *= scale
-        center = np.array([WIDTH / 2, HEIGHT / 2 + 10], dtype=float)
-        arr += center
-        angles = np.arctan2(arr[:, 1] - center[1], arr[:, 0] - center[0])
-        order = np.argsort(angles)
-        ordered = arr[order]
-        idx = np.linspace(0, len(ordered) - 1, count).astype(int)
-        pts = ordered[idx]
-        self.points = [(float(x), float(y)) for x, y in pts]
-        self.key = key
-        return self.points
 
 
 class SegmentElement(Element):
@@ -473,16 +504,21 @@ class MotionBlurEffectElement(Element):
         self.history = []
 
     def render(self, surface, rs):
-        self.history.append(surface.copy())
+        # store a smaller copy to reduce memory/copy bandwidth
+        scale = 0.46
+        sw, sh = max(1, int(WIDTH * scale)), max(1, int(HEIGHT * scale))
+        tiny = pygame.transform.smoothscale(surface, (sw, sh))
+        self.history.append(tiny)
         if len(self.history) > 6:
             self.history.pop(0)
         for idx, frame in enumerate(reversed(self.history[:-1])):
             alpha = max(14, int((92 - idx * 15) * (1.0 - rs.smooth_beat * 0.35)))
-            frame.set_alpha(alpha)
+            frame_up = pygame.transform.smoothscale(frame, (WIDTH, HEIGHT))
+            frame_up.set_alpha(alpha)
             off = idx + 1
             dx = int(-rs.shake[0] * 0.18 * off)
             dy = int(-rs.shake[1] * 0.18 * off)
-            surface.blit(frame, (dx, dy), special_flags=pygame.BLEND_RGBA_ADD)
+            surface.blit(frame_up, (dx, dy), special_flags=pygame.BLEND_RGBA_ADD)
 
 
 class MirrorEffectElement(Element):
@@ -566,6 +602,7 @@ def extract_cover(file):
 
 def reload_audio(file):
     global data, samplerate, sound, title, artist, RS
+    global play_pos_ms
     try:
         data, samplerate = sf.read(file)
         if len(data.shape) > 1:
@@ -708,7 +745,14 @@ def main():
                 pos = event.pos
                 if SLIDER_RECT.collidepoint(pos):
                     volume = max(0.0, min(1.0, (pos[0] - SLIDER_RECT.x) / SLIDER_RECT.width))
-                    if sound:
+                    # set volume on playing channel when available; Sound.set_volume
+                    # affects future playbacks only, Channel.set_volume updates current playback
+                    if play_channel:
+                        try:
+                            play_channel.set_volume(volume)
+                        except Exception:
+                            pass
+                    elif sound:
                         sound.set_volume(volume)
                 for name, rect in BUTTON_RECTS.items():
                     if rect.collidepoint(pos):
