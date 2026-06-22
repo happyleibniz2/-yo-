@@ -168,7 +168,7 @@ class AudioDataProviderElement(Element):
                 chunk = data[idx:idx + 2048]
                 rms = float(np.sqrt(np.mean(chunk * chunk)))
                 rs.rms = rms
-                rs.rms_smooth = rs.rms_smooth * 0.85 + rms * 0.15
+                rs.rms_smooth = rs.rms_smooth * 0.90 + rms * 0.10
                 rs.rms_history.append(rms)
                 if len(rs.rms_history) > 40:
                     rs.rms_history.pop(0)
@@ -189,7 +189,7 @@ class AudioDataProviderElement(Element):
             rs.fft[:] = np.maximum(0.0, np.sin(xs * 9.0 + phase) * 0.25 + np.sin(xs * 31.0 - phase * 1.7) * 0.18)
             demo_rms = 0.04 + max(0.0, math.sin(phase * 1.7)) * 0.04
             rs.rms = demo_rms
-            rs.rms_smooth = rs.rms_smooth * 0.85 + demo_rms * 0.15
+            rs.rms_smooth = rs.rms_smooth * 0.90 + demo_rms * 0.10
             rs.rms_history.append(demo_rms)
             if len(rs.rms_history) > 40:
                 rs.rms_history.pop(0)
@@ -266,11 +266,16 @@ class ImageElement(Element):
         pygame.draw.circle(surface, (6, 7, 11, 180), (cx + 5, cy + 7), rad + 6)
         if rs.original_cover:
             sz = rad * 2
-            pg_img = pygame.transform.smoothscale(rs.original_cover, (sz, sz))
+            pg_img = pygame.transform.smoothscale(
+                rs.original_cover,
+                (sz, sz)
+            ).convert_alpha()
             mask = pygame.Surface((sz, sz), pygame.SRCALPHA)
             pygame.draw.circle(mask, (255, 255, 255, 255), (rad, rad), rad)
-            pg_img.blit(mask, (0, 0), special_flags=pygame.BLEND_RGBA_MIN)
-            surface.blit(pg_img, (cx - rad, cy - rad))
+            result = pygame.Surface((sz, sz), pygame.SRCALPHA)
+            result.blit(pg_img, (0, 0))
+            result.blit(mask, (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
+            surface.blit(result, (cx - rad, cy - rad))
         else:
             pygame.draw.circle(surface, (20, 22, 30), (cx, cy), rad)
             pygame.draw.circle(surface, (0, 235, 255), (cx, cy), rad, 3)
@@ -421,7 +426,7 @@ class ParticlesElement(Element):
             cx, cy = CENTER[0] + rs.shake[0], CENTER[1] + rs.shake[1]
             for _ in range(int(5 + rs.smooth_beat * 18)):
                 peak_angle = (rs.peak_bar_index / SAMPLE_COUNT) * math.tau
-                a = peak_angle + random.uniform(-0.5, 0.5)
+                a = peak_angle + random.uniform(-0.4, 0.4)
                 s = random.uniform(70, 260) * (0.4 + rs.smooth_beat)
                 self.particles.append(Particle(cx, cy, math.cos(a) * s, math.sin(a) * s, random.uniform(0.7, 2.4), random.uniform(1.5, 4.5)))
         for p in self.particles[:]:
